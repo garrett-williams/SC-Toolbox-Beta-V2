@@ -8,8 +8,12 @@ dist/
 # Build artifacts (keep build scripts, ignore generated files)
 build/staging/
 build/Output/
+build/Releases/
 build/*.zip
 build/get-pip.py
+build/build_log_*
+build/**/bin/
+build/**/obj/
 
 # Virtual environments
 .venv/

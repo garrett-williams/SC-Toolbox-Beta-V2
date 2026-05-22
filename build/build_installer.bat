@@ -20,7 +20,19 @@ color 0E
 set "ROOT=%~dp0.."
 set "BUILD=%~dp0"
 set "STAGE=%BUILD%staging"
-set "PYTHON_VER=3.12.9"
+
+:: Build mode — first arg picks the installer toolchain.
+::   (empty / inno)  → Inno Setup wizard installer (default, legacy)
+::   velopack         → Velopack pack/installer with delta auto-updates
+:: The staging logic is identical for both; only Step 8 diverges.
+set "BUILD_MODE=%~1"
+if /I "%BUILD_MODE%"=="velopack" (set "BUILD_MODE=velopack") else (set "BUILD_MODE=inno")
+:: Python 3.14 to match the dev-machine runtime. Bumped from 3.12 so
+:: the install behaves identically to local: same interpreter, same
+:: import speed characteristics, same wheel set. If a future dep drops
+:: 3.14 wheels, fall back to 3.13.x — every dep we ship currently has
+:: 3.14 wheels on PyPI as of April 2026.
+set "PYTHON_VER=3.14.0"
 set "PYTHON_ZIP=python-%PYTHON_VER%-embed-amd64.zip"
 set "PYTHON_URL=https://www.python.org/ftp/python/%PYTHON_VER%/%PYTHON_ZIP%"
 set "GETPIP_URL=https://bootstrap.pypa.io/get-pip.py"
@@ -54,9 +66,23 @@ echo  =============================================
 echo.
 
 :: ── Step 1: Clean previous build ──
+:: rmdir silently leaves files behind when they're locked by another
+:: process (file explorer preview, AV scanner, running launcher).
+:: That used to produce a "mixed Python" staging — a partial 3.12 leftover
+:: + new 3.14 extraction, which then crashed pip bootstrap. Use PowerShell
+:: Remove-Item which respects locks better, then verify the dir is gone.
+:: If something IS holding files, fail loudly so the user can close it
+:: instead of producing a half-broken install.
 if exist "%STAGE%" (
     echo  [*] Cleaning previous staging directory...
-    rmdir /s /q "%STAGE%"
+    powershell -NoProfile -Command "Remove-Item -Path '%STAGE%' -Recurse -Force -ErrorAction SilentlyContinue"
+    if exist "%STAGE%" (
+        echo  [!] Could not fully remove staging directory.
+        echo      Some file is locked by another process. Close the launcher,
+        echo      any skill windows, file explorer previews, and AV scanners,
+        echo      then re-run this script.
+        goto :fail
+    )
 )
 mkdir "%STAGE%"
 
@@ -99,13 +125,29 @@ if !errorlevel! neq 0 (
 )
 
 :: ── Step 6: Install runtime dependencies ──
-:: IMPORTANT: onnxruntime + numpy are required by the Mining Signals
-:: HUD reader (mass/resistance/instability OCR via the digit CNN).
-:: Without them the HUD scan silently no-ops while the signal scanner
-:: still works — users see "signal scan works, mass/resistance never
-:: appears" and assume the tool is broken.
-echo  [*] Installing PySide6, requests, pynput, mss, pytesseract, Pillow, onnxruntime, numpy...
-"%STAGE%\python\python.exe" -m pip install PySide6>=6.5.0 requests>=2.28.0 pynput>=1.7.6 mss>=9.0.0 pytesseract>=0.3.10 Pillow>=10.0.0 cryptography>=42.0.0 onnxruntime>=1.17.0 numpy>=1.24.0 onnx>=1.15.0 --no-warn-script-location --quiet
+:: IMPORTANT: onnxruntime + numpy + scipy + Pillow + onnx are required
+:: by the Mining Signals HUD reader (mass/resistance/instability OCR
+:: via the digit CNN) AND the signal scanner (NCC anchor, comma
+:: masking, CC labelling, multi-recipe binarize).
+::
+:: scipy specifically is used by:
+::   * ocr/sc_ocr/api.py — _adaptive_binarize_multi (multi-recipe
+::                          binarization with span-count selection)
+::   * ocr/sc_ocr/signal_anchor.py — connected-component labelling
+::                          for icon validation
+::   * ocr/sc_ocr/label_match.py   — template matching
+::
+:: Without it the signal scanner silently falls through to Tesseract-
+:: only mode (much slower + less accurate). Past builds shipped
+:: without scipy and the failure mode was invisible to end users
+:: (CNN voters silently no-op'd via try/except).
+echo  [*] Installing PySide6, requests, pynput, mss, pytesseract, Pillow, scipy, onnxruntime, numpy...
+:: Each package spec is quoted so cmd doesn't parse the `>=` as a
+:: stdout redirect (which created stray zero-byte files like
+:: build\1.15.0, build\1.24.0, build\42.0.0 from earlier builds —
+:: harmless cosmetic cruft but noise in the build dir).  Fixed in
+:: the v2.2.10 audit pass.
+"%STAGE%\python\python.exe" -m pip install "PySide6>=6.5.0" "requests>=2.28.0" "pynput>=1.7.6" "mss>=9.0.0" "pytesseract>=0.3.10" "Pillow>=10.0.0" "cryptography>=42.0.0" "onnxruntime>=1.17.0" "numpy>=1.24.0" "scipy>=1.11.0" "onnx>=1.15.0" --no-warn-script-location --quiet
 if !errorlevel! neq 0 (
     echo  [!] Dependency installation failed.
     goto :fail
@@ -196,7 +238,7 @@ xcopy "%ROOT%\ui\*.py" "%STAGE%\ui\" /s /i /q >nul
 
 :: skills/ — copy each skill, then prune non-runtime files
 echo  [*] Staging skills...
-for %%S in (Cargo_loader Craft_Database DPS_Calculator Market_Finder Mining_Loadout Mission_Database Trade_Hub) do (
+for %%S in (Cargo_loader Craft_Database DPS_Calculator Market_Finder Mining_Loadout Mission_Database Mouse_Blocker Trade_Hub) do (
     if exist "%ROOT%\skills\%%S" (
         xcopy "%ROOT%\skills\%%S" "%STAGE%\skills\%%S\" /s /i /q >nul
 
@@ -280,30 +322,41 @@ for %%D in (0 1 2 3 4 5 6 7 8 9) do (
 :: paths (ship_loadouts, ledger_file). Replace it with a clean default
 :: so new installs start with null regions and prompt the user to set
 :: them up via the in-app region selectors.
-echo  [*] Sanitizing Mining_Signals config (stripping personal data)...
+:: Mirrors the dev-machine config exactly — same keys, same defaults,
+:: same scan_interval_seconds=3 (1 was too aggressive; scans piled up
+:: behind each other on the bundled Python causing 95%% of scan ticks
+:: to be skipped). Personal/per-machine fields (paths, screen regions,
+:: active ship) are nulled. Everything else matches local so behavior
+:: is identical out-of-the-box.
+echo  [*] Sanitizing Mining_Signals config (matching local defaults, stripping personal data)...
 (
     echo {
     echo   "refresh_interval_minutes": 60,
-    echo   "scan_interval_seconds": 1,
+    echo   "scan_interval_seconds": 3,
     echo   "ocr_region": null,
     echo   "hud_region": null,
-    echo   "refinery_ocr_region": null,
-    echo   "ship_loadouts": {},
-    echo   "active_ship": null,
-    echo   "gadget_quantities": {
-    echo     "Okunis": 10,
-    echo     "BoreMax": 10,
-    echo     "OptiMax": 10,
-    echo     "Sabir": 10,
-    echo     "Stalwart": 10,
-    echo     "Waveshift": 10
+    echo   "ship_loadouts": {
+    echo     "golem": null,
+    echo     "prospector": null,
+    echo     "mole": null
     echo   },
+    echo   "active_ship": null,
+    echo   "gadget_quantities": {},
     echo   "always_use_best_gadget": false,
+    echo   "fleet_loadouts": [],
+    echo   "fleet_player_counts": {},
+    echo   "module_uses_remaining": {},
+    echo   "game_dir": null,
+    echo   "refinery_picked_up": [],
+    echo   "refinery_deleted": [],
+    echo   "refinery_ocr_region": null,
+    echo   "refinery_orders": [],
+    echo   "refinery_auto_scan": false,
     echo   "calc_mode": "fleet",
-    echo   "bubble_position": null,
-    echo   "break_bubble_position": null,
+    echo   "salvage_loadouts": [],
     echo   "ledger_file": null,
-    echo   "game_dir": null
+    echo   "bubble_position": null,
+    echo   "break_bubble_position": null
     echo }
 ) > "%STAGE%\tools\Mining_Signals\mining_signals_config.json"
 
@@ -321,8 +374,13 @@ del /q "%STAGE%\tools\Mining_Signals\mining_signals.log.*" 2>nul
 :: (potential third-party data exposure surface).
 echo  [*] Removing OCR training data, scripts, and dev artifacts...
 :: Training datasets (the LIVE training_data/ stub from above is preserved).
+:: NOTE: training_data_blacklist is intentionally NOT in this list — despite
+:: the misleading directory name, signal_anchor.py loads its location-pin
+:: icon template from there (`_ICON_TEMPLATES_DIR = _TOOL_DIR / "training_data_blacklist"`).
+:: Stripping it makes _load_icon_templates() return [], which makes
+:: find_icon() return None on every frame, which keeps sig_present=False
+:: forever — i.e. the signature scanner silently no-ops. Keep the dir.
 for %%D in (
-    training_data_blacklist
     training_data_clean
     training_data_crnn
     training_data_panels
@@ -336,7 +394,29 @@ for %%D in (
 ) do (
     if exist "%STAGE%\tools\Mining_Signals\%%D" rmdir /s /q "%STAGE%\tools\Mining_Signals\%%D"
 )
+:: Restore runtime files from scripts/ that the wholesale rmdir above
+:: removed. These three are imported at runtime — not dev-only:
+::   * extract_labeled_glyphs.py — api.py imports its
+::     _locate_icon_via_blacklist_match + _isolate_main_row helpers
+::     for the signature-scan pipeline.
+::   * signature_finder_viewer.py / glyph_reader_viewer.py — UI popouts
+::     opened from buttons in the calibration dialog.
+:: All other ~40 files in scripts/ are training/labeling tooling and
+:: stay stripped.
+mkdir "%STAGE%\tools\Mining_Signals\scripts" 2>nul
+for %%F in (
+    extract_labeled_glyphs.py
+    signature_finder_viewer.py
+    glyph_reader_viewer.py
+) do (
+    if exist "%ROOT%\tools\Mining_Signals\scripts\%%F" (
+        copy "%ROOT%\tools\Mining_Signals\scripts\%%F" "%STAGE%\tools\Mining_Signals\scripts\%%F" >nul
+    )
+)
 :: Trainer modules and synthesis helpers in ocr/ — no runtime imports.
+:: NOTE: templates_furore.py was previously listed here but it IS a
+:: runtime import (sc_ocr/api.py imports it for the template-voter
+:: fallback when the neural engines disagree). Keep it in staging.
 for %%F in (
     pretrain_crnn.py
     train_crnn.py
@@ -344,7 +424,6 @@ for %%F in (
     train_sklearn.py
     train_torch.py
     synth_data.py
-    templates_furore.py
 ) do (
     del /q "%STAGE%\tools\Mining_Signals\ocr\%%F" 2>nul
 )
@@ -413,10 +492,14 @@ if exist "%PADDLE_PY%" (
         echo  [!] pip bootstrap failed in Paddle sidecar.
         goto :fail
     )
-    :: Install paddlepaddle 3.0.0 + paddleocr + dependencies.
-    :: paddlepaddle 3.3.1 crashes on first inference — pin to 3.0.0.
+    rem Install paddlepaddle 3.0.0 + paddleocr + dependencies.
+    rem paddlepaddle 3.3.1 crashes on first inference — pin to 3.0.0.
+    rem --only-binary=:all: forces wheel-only resolution. Without it pip will
+    rem pick python-bidi==0.6.9 (sdist + Rust/maturin build backend) which
+    rem fails on the embeddable Python with no Rust toolchain. Wheel-only
+    rem resolution falls back to python-bidi==0.6.7 (cp313 wheel exists).
     echo  [*] Installing paddlepaddle==3.0.0, paddleocr, numpy, Pillow...
-    "%PADDLE_PY%" -m pip install paddlepaddle==3.0.0 paddleocr numpy Pillow --no-warn-script-location --quiet
+    "%PADDLE_PY%" -m pip install --only-binary=:all: paddlepaddle==3.0.0 paddleocr numpy Pillow --no-warn-script-location --quiet
     if !errorlevel! neq 0 (
         echo  [!] Paddle sidecar dependency install failed.
         goto :fail
@@ -479,9 +562,22 @@ for %%D in (
 ) do (
     if exist "%PY313_SP%\paddlex\configs\modules\%%D" rmdir /s /q "%PY313_SP%\paddlex\configs\modules\%%D"
 )
-for %%D in (doc_vlm open_vocabulary_detection) do (
-    if exist "%PY313_SP%\paddlex\inference\models\%%D" rmdir /s /q "%PY313_SP%\paddlex\inference\models\%%D"
-)
+:: NOTE (v2.2.7+): we no longer delete doc_vlm or open_vocabulary_detection
+:: from paddlex/inference/models/. Both are unused at runtime, BUT paddlex's
+:: own __init__.py chains UNCONDITIONALLY import them via:
+::     paddlex/inference/__init__.py
+::       → paddlex/inference/pipelines/__init__.py
+::         → from .doc_understanding import DocUnderstandingPipeline
+::           → paddlex/inference/pipelines/doc_understanding/pipeline.py
+::             → from ...models.doc_vlm.result import DocVLMResult  ← FAILS
+::
+:: Deleting these dirs makes the daemon fail to start with:
+::   "daemon fatal: No module named 'paddlex.inference.models.doc_vlm'"
+:: which kills the PaddleOCR voter and degrades signal OCR throughput.
+:: Cost of keeping them: ~30 MB. Worth it.
+:: for %%D in (doc_vlm open_vocabulary_detection) do (
+::     if exist "%PY313_SP%\paddlex\inference\models\%%D" rmdir /s /q "%PY313_SP%\paddlex\inference\models\%%D"
+:: )
 :: 2e. paddle GPU compile-config tile data — only used if running on
 ::     specific NVIDIA GPUs (V100, A100). The OCR sidecar runs CPU-only
 ::     in the shipped installer, so this is dead weight with deep paths.
@@ -530,6 +626,29 @@ if not exist "%PADDLE_PY%" (
     set "VALIDATION_OK=0"
 )
 
+:: Runtime helpers from scripts/ — api.py + calibration_dialog import these.
+:: The wholesale rmdir of scripts/ above must be balanced by the copy-back
+:: step that restores the three runtime files. If any of them go missing
+:: the signal CNN voter silently no-ops and two UI buttons error out.
+if not exist "%STAGE%\tools\Mining_Signals\scripts\extract_labeled_glyphs.py" (
+    echo  [!] MISSING: scripts\extract_labeled_glyphs.py — signal CNN voter broken
+    set "VALIDATION_OK=0"
+)
+if not exist "%STAGE%\tools\Mining_Signals\scripts\signature_finder_viewer.py" (
+    echo  [!] MISSING: scripts\signature_finder_viewer.py — calibration "Signature Finder" button broken
+    set "VALIDATION_OK=0"
+)
+if not exist "%STAGE%\tools\Mining_Signals\scripts\glyph_reader_viewer.py" (
+    echo  [!] MISSING: scripts\glyph_reader_viewer.py — calibration "Glyph Reader" button broken
+    set "VALIDATION_OK=0"
+)
+:: Furore-template voter — 6th deterministic voter in the OCR ensemble.
+:: api.py imports it as the template-fallback when neural engines disagree.
+if not exist "%STAGE%\tools\Mining_Signals\ocr\templates_furore.py" (
+    echo  [!] MISSING: ocr\templates_furore.py — template voter broken
+    set "VALIDATION_OK=0"
+)
+
 :: Main Python deps that the HUD scanner needs at import time
 if not exist "%STAGE%\python\Lib\site-packages\onnxruntime" (
     echo  [!] MISSING: onnxruntime pip package — HUD scanner broken
@@ -537,6 +656,10 @@ if not exist "%STAGE%\python\Lib\site-packages\onnxruntime" (
 )
 if not exist "%STAGE%\python\Lib\site-packages\numpy" (
     echo  [!] MISSING: numpy pip package — HUD + refinery scanners broken
+    set "VALIDATION_OK=0"
+)
+if not exist "%STAGE%\python\Lib\site-packages\onnx" (
+    echo  [!] MISSING: onnx pip package — online_learner ONNX export broken
     set "VALIDATION_OK=0"
 )
 if not exist "%STAGE%\python\Lib\site-packages\PIL" (
@@ -590,6 +713,22 @@ if !errorlevel!==0 (
     echo  [OK] No buggy config.get-with-default patterns found.
 )
 
+:: ── Step 7e: Staging import smoke test ──
+:: Spawns the staging Python on every skill/tool entry script and
+:: verifies it imports cleanly. The file-existence checks above can't
+:: see runtime gaps like "missing pip package", "module stripped wrongly",
+:: or "transitive import broke" — this catches those before Inno Setup
+:: runs. Each skill is tested in its own subprocess so state cannot leak.
+::
+:: Self-discovers any new skill that ships a skill.json — no edits to
+:: this script needed when a new tool is added.
+echo  [*] Running staging import smoke test...
+"%STAGE%\python\python.exe" "%BUILD%staging_import_test.py" "%STAGE%"
+if !errorlevel! neq 0 (
+    echo  [!] Staging import smoke test FAILED — see tracebacks above.
+    set "VALIDATION_OK=0"
+)
+
 if "!VALIDATION_OK!"=="0" (
     echo.
     echo  [!] Staging validation FAILED — see errors above.
@@ -598,9 +737,19 @@ if "!VALIDATION_OK!"=="0" (
 )
 echo  [OK] All runtime components validated.
 
-:: Global cleanup — remove all __pycache__, .pytest_cache, and tests/ dirs
+:: Global cleanup — remove all __pycache__, .pytest_cache, tests/ and
+:: .claude/ dirs.
+::
+:: .claude/ holds Claude Code session + git-worktree state that has no
+:: business in a shipped installer: it bloats the package, and because
+:: a copied worktree directory can later be grabbed as a process CWD,
+:: the NEXT build's staging-clean step (Step 1) fails with "being used
+:: by another process" — exactly the failure hit during the v2.2.10
+:: build. The per-tool strip in Step 7 only covered tools\<T>\.claude;
+:: this recursive pass also catches skills\<S>\.claude, the staging
+:: root, and any other nesting.
 echo  [*] Cleaning staging directory...
-powershell -Command "Get-ChildItem -Path '%STAGE%' -Recurse -Directory -Force | Where-Object { $_.Name -in @('__pycache__','.pytest_cache','tests') } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"
+powershell -Command "Get-ChildItem -Path '%STAGE%' -Recurse -Directory -Force | Where-Object { $_.Name -in @('__pycache__','.pytest_cache','tests','.claude') } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"
 
 :: locales/ — only include compiled .mo translation files, not the .pot template
 :: Copies the full locales/ tree but skips .pot files (dev-only)
@@ -616,6 +765,17 @@ if exist "%ROOT%\locales" (
 echo  [OK] Staging complete.
 
 :: ── Step 8: Build installer ──
+:: Diverges here based on BUILD_MODE:
+::   * inno     — runs Inno Setup compiler against SC_Toolbox_Installer.iss,
+::                produces Output\SC_Toolbox_Setup_<ver>.exe (single .exe, ~838 MB).
+::   * velopack — builds the launcher .exe (replaces the .vbs as the entry
+::                point), then runs vpk pack which produces Releases\
+::                Setup.exe + nupkg + portable .zip + RELEASES manifest.
+::                Delta updates flow through the .nupkg files.
+if /I "%BUILD_MODE%"=="velopack" goto :build_velopack
+goto :build_inno
+
+:build_inno
 echo.
 echo  [*] Running Inno Setup compiler...
 "%ISCC%" "%BUILD%SC_Toolbox_Installer.iss"
@@ -623,11 +783,87 @@ if !errorlevel! neq 0 (
     echo  [!] Inno Setup compilation failed.
     goto :fail
 )
+echo.
+echo  =============================================
+echo   [OK] Inno installer built successfully!
+echo   Output: %BUILD%Output\SC_Toolbox_Setup.exe
+echo  =============================================
+echo.
+goto :done
+
+:build_velopack
+:: ── Step 8a: Build the launcher .exe ──
+:: Velopack requires a real .exe entry point that calls
+:: VelopackApp.Build().Run() at startup. The launcher project lives in
+:: build\launcher\ and is a small WinExe that subprocesses the bundled
+:: Python on skill_launcher.py — same behavior as the legacy .vbs but
+:: Velopack-aware (handles --squirrel-firstrun, etc.).
+echo.
+echo  [*] Building launcher .exe (dotnet publish)...
+pushd "%BUILD%launcher"
+dotnet publish -c Release --nologo -v quiet
+if !errorlevel! neq 0 (
+    popd
+    echo  [!] Launcher build failed.
+    goto :fail
+)
+popd
+set "LAUNCHER_EXE=%BUILD%launcher\bin\Release\net8.0-windows\win-x64\publish\SC_Toolbox.exe"
+if not exist "%LAUNCHER_EXE%" (
+    echo  [!] Launcher .exe missing at expected path: %LAUNCHER_EXE%
+    goto :fail
+)
+copy /Y "%LAUNCHER_EXE%" "%STAGE%\SC_Toolbox.exe" >nul
+echo  [OK] Launcher staged.
+
+:: ── Step 8b: Read version from pyproject.toml ──
+:: Single source of truth — no more drift between .iss MyAppVersion and
+:: pyproject.toml. We pipe the Python reader's output to a temp file
+:: then read it via `set /p`. The for /f-with-backticks approach kept
+:: tripping cmd's quote/path parser ("filename, directory name, or
+:: volume label syntax is incorrect") on quoted paths with spaces.
+:: Temp-file pipeline is dumb but bulletproof.
+set "PACK_VER="
+set "VERSION_FILE=%TEMP%\sc_toolbox_pack_version.txt"
+"%STAGE%\python\python.exe" "%BUILD%read_version.py" "%ROOT%\pyproject.toml" > "%VERSION_FILE%"
+if !errorlevel! neq 0 (
+    echo  [!] Version reader failed.
+    goto :fail
+)
+set /p PACK_VER=<"%VERSION_FILE%"
+del /q "%VERSION_FILE%" 2>nul
+if not defined PACK_VER (
+    echo  [!] Could not read version from pyproject.toml
+    goto :fail
+)
+echo  [*] Packing Velopack release v!PACK_VER!...
+
+:: ── Step 8c: Run vpk pack ──
+:: DOTNET_ROLL_FORWARD=Major lets vpk run against ASP.NET Core 10
+:: (we don't bundle 9 separately to save install space).
+set "DOTNET_ROLL_FORWARD=Major"
+vpk pack ^
+    -u "SC_Toolbox" ^
+    -v "!PACK_VER!" ^
+    -p "%STAGE%" ^
+    -e "SC_Toolbox.exe" ^
+    -i "%ROOT%\assets\sc_toolbox.ico" ^
+    --packTitle "SC Toolbox" ^
+    --packAuthors "ScPlaceholder" ^
+    -o "%BUILD%Releases"
+if !errorlevel! neq 0 (
+    echo  [!] vpk pack failed.
+    goto :fail
+)
 
 echo.
 echo  =============================================
-echo   [OK] Installer built successfully!
-echo   Output: %BUILD%Output\SC_Toolbox_Setup.exe
+echo   [OK] Velopack release built successfully!
+echo   Output: %BUILD%Releases\
+echo     - SC_Toolbox-win-Setup.exe    (full installer)
+echo     - SC_Toolbox-!PACK_VER!-full.nupkg
+echo     - SC_Toolbox-win-Portable.zip
+echo     - RELEASES manifest
 echo  =============================================
 echo.
 goto :done
