@@ -142,29 +142,20 @@ _CLOSE_BTN_STYLE = """
 # upgrades. The legacy path is kept as a one-shot migration source — if the
 # new path doesn't exist but the legacy one does, we read the legacy file on
 # first load and the next save lands at the persistent path.
-def _persistent_config_dir() -> str:
-    """Return the directory where the cross-upgrade config lives.
-    Creates it if needed. Falls back to the legacy in-app dir if
-    LOCALAPPDATA can't be resolved (extremely rare — e.g. embedded
-    installs without standard env)."""
-    base = os.environ.get("LOCALAPPDATA")
-    if not base:
-        base = os.path.join(os.path.expanduser("~"), "AppData", "Local")
-    target = os.path.join(base, "SC_Toolbox", "mining_signals")
-    try:
-        os.makedirs(target, exist_ok=True)
-        return target
-    except OSError:
-        # Fallback: in-app dir. Settings won't survive upgrades but the
-        # app at least keeps working.
-        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-_LEGACY_CONFIG_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "mining_signals_config.json",
+#
+# Path resolution itself lives in mining_shared/paths.py so this
+# process (the main app, which WRITES the config) and the
+# signature_finder_viewer popout (a separate process that READS the
+# config) compute identical paths from one source of truth — fixes
+# the silent viewer/app drift class flagged in the v2.2.10 audit.
+from mining_shared.paths import (
+    config_file as _config_file_fn,
+    legacy_config_file as _legacy_config_file_fn,
+    persistent_config_dir as _persistent_config_dir,
 )
-_CONFIG_FILE = os.path.join(_persistent_config_dir(), "config.json")
+
+_LEGACY_CONFIG_FILE = _legacy_config_file_fn()
+_CONFIG_FILE = _config_file_fn()
 
 # Ship slots available in the Mining Ships tab. Keys are the internal
 # ids stored in config; values are display labels.
@@ -358,7 +349,19 @@ def _save_config(cfg: dict) -> None:
             json.dump(cfg, f, indent=2)
         os.replace(tmp, _CONFIG_FILE)
     except OSError as exc:
-        log.warning("Failed to save config: %s", exc)
+        # ERROR (not warning).  Silent save failures previously meant
+        # users would "set" a region in the UI but nothing ever reached
+        # disk, with zero feedback.  Bumping severity makes it visible
+        # in any log capture, and the startup config log line (in the
+        # MiningSignalsApp __init__) includes a writability probe so
+        # the failure mode is diagnosable from a single log file
+        # without having to walk the user through opening AppData.
+        log.error(
+            "config: SAVE FAILED — %s.  Settings WILL NOT PERSIST.  "
+            "Most likely cause: write blocked by antivirus / "
+            "Controlled Folder Access / permissions on %s",
+            exc, _CONFIG_FILE,
+        )
 
 
 class _DataLoader(QObject):
@@ -412,6 +415,30 @@ class MiningSignalsApp(SCWindow):
         self.restore_geometry_from_args(x, y, w, h, opacity)
 
         self._config = _load_config()
+        # Diagnostic log — surfaces which config file was loaded, the
+        # two scan regions, and a writability probe.  Lets us debug
+        # "region set doesn't persist" reports from a single log line
+        # instead of having to walk the user through opening AppData.
+        # Most useful when ocr_region or hud_region show as null while
+        # the user insists they set them: combine with the writable=
+        # flag to instantly tell whether it's a write-block (False) or
+        # an unsaved-set (True with regions null).
+        try:
+            _probe = _CONFIG_FILE + ".writetest"
+            with open(_probe, "w", encoding="utf-8") as _f:
+                _f.write("ok")
+            os.remove(_probe)
+            _writable = True
+        except OSError:
+            _writable = False
+        log.info(
+            "config: loaded from %s · writable=%s · "
+            "ocr_region=%s · hud_region=%s",
+            _CONFIG_FILE if os.path.isfile(_CONFIG_FILE) else _LEGACY_CONFIG_FILE,
+            _writable,
+            self._config.get("ocr_region"),
+            self._config.get("hud_region"),
+        )
         self._cmd_file = cmd_file
         self._rows: list[dict] = []
         self._all_table_data: list[dict] = []
@@ -3422,18 +3449,25 @@ class MiningSignalsApp(SCWindow):
             key="set_scan_region",
             title="Set Scanning Region",
             body_html=(
-                "<p style='margin-top:0;'>Draw a tight box around the "
-                "<b style='color:#33dd88;'>signal value number</b> on "
-                "your mining-scanner HUD &mdash; the orange/red number "
-                "next to the resource icon (e.g. <b>10,150</b>).</p>"
-                "<p><b>Include only the digits.</b> Exclude:</p>"
+                "<p style='margin-top:0;'>Select the entire <b "
+                "style='color:#33dd88;'>signature scanner panel</b> on "
+                "your radial menu &mdash; the panel showing the "
+                "location-pin icon AND the signal value number "
+                "(e.g. <b>10,150</b>).</p>"
+                "<p style='color:#33dd88;'><b>Include BOTH:</b></p>"
                 "<ul style='margin-top:4px;'>"
-                "<li>The resource icon</li>"
-                "<li>The label text (\"SIGNAL\", \"VALUE\", etc.)</li>"
-                "<li>Empty space around the number</li>"
+                "<li>The <b>location-pin icon</b> on the left &mdash; "
+                "the scanner uses it to anchor.  Without it, the scan "
+                "cannot find the panel and silently returns nothing.</li>"
+                "<li>The <b>signal value digits</b> on the right</li>"
                 "</ul>"
-                "<p style='color:#888;'>A tighter box gives the OCR "
-                "fewer pixels to misread.</p>"
+                "<p>Add a small margin around them.  A region of about "
+                "<b>150&times;50 pixels</b> or larger generally works "
+                "well.</p>"
+                "<p style='color:#ff5533;'>Do <b>NOT</b> draw a tight "
+                "box around only the digits &mdash; that was the "
+                "previous wording and it's wrong: without the icon "
+                "the anchor has nothing to lock onto.</p>"
             ),
             on_proceed=self._open_scan_region_selector,
         )

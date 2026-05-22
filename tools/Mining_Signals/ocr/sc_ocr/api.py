@@ -11884,10 +11884,30 @@ def _signal_recognize_pil(img, region: Optional[dict] = None) -> Optional[int]:
         # cluster), so the gap-cut would mistake a right-edge pill-
         # cap artifact for a label-to-value boundary and erase the
         # leading digits. See ``_segment_glyphs`` for details.
+        #
+        # NameError fix (v2.2.10): the prior call passed ``field=field``,
+        # copy-pasted from the HUD per-mineral-field OCR path where
+        # ``field`` is a parameter ("mass" / "resistance" /
+        # "instability"). ``_signal_recognize_pil`` has no ``field``
+        # variable in scope, so on the column-projection fallback this
+        # raised ``NameError: name 'field' is not defined`` — swallowed
+        # by the outer ``except Exception`` at the bottom of this try
+        # block as a DEBUG log ("HUD-style primary CNN path failed").
+        # The result: any user whose anchor missed the proportional
+        # segmenter's confidence floor silently lost the primary CNN
+        # voter, and the signature scan fell through to the lower-
+        # ranked CRNN / gray gates. The reported runtime logs (anchor
+        # miss + "name 'field' is not defined" + CRNN reading "2,520"
+        # but lexicon_hit=False) are this exact failure cascade.
+        #
+        # Drop the kwarg: ``_segment_glyphs`` only branches on
+        # ``field`` for HUD-specific behaviour (mass/resistance/
+        # instability leading-narrow-span tuning); signatures don't
+        # use any of those branches, so the default empty string is
+        # the intended behaviour for this call.
         if not _proportional_used:
             _hud_pri_crops, _hud_pri_boxes = _segment_glyphs(
                 _work_canon, _hud_bin, disable_gap_cut=True,
-                field=field,
             )
         # The proportional segmenter produces bboxes that already
         # respect the structural prior (D,DDD or DD,DDD with comma
@@ -12355,10 +12375,31 @@ def _signal_recognize_pil(img, region: Optional[dict] = None) -> Optional[int]:
                     _n_digit_crops,
                 )
     except Exception as _hud_path_exc:
-        log.debug(
-            "sc_ocr.signal: HUD-style primary CNN path failed: %s",
+        # Severity split (v2.2.10): this catch-all spent an unknown
+        # amount of time silently swallowing a ``NameError: name
+        # 'field' is not defined`` at DEBUG level because the
+        # column-projection fallback referenced an undefined ``field``
+        # (now fixed above). Genuine programming bugs
+        # (NameError / AttributeError / TypeError / SyntaxError) get
+        # WARNING so the audit pipeline + log triage will surface them
+        # on the next user report — every other exception type stays
+        # at DEBUG so expected runtime conditions (the CNN model
+        # being unavailable, etc.) don't spam the log.
+        if isinstance(
             _hud_path_exc,
-        )
+            (NameError, AttributeError, TypeError, SyntaxError),
+        ):
+            log.warning(
+                "sc_ocr.signal: HUD-style primary CNN path raised "
+                "%s (%s) — likely a code bug, not a runtime failure. "
+                "Falling through to downstream voters.",
+                type(_hud_path_exc).__name__, _hud_path_exc,
+            )
+        else:
+            log.debug(
+                "sc_ocr.signal: HUD-style primary CNN path failed: %s",
+                _hud_path_exc,
+            )
 
     # ──────────────────────────────────────────────────────────────
     # NEW VOTER HIERARCHY (user-configured 2026-05-06):

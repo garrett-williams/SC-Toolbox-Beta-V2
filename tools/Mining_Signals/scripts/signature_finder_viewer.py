@@ -42,20 +42,16 @@ TOOL = THIS.parent.parent
 sys.path.insert(0, str(TOOL))
 sys.path.insert(0, str(TOOL / "scripts"))
 
-# Config lives at the persistent path the main app writes to (survives
-# Velopack upgrades). Mirrors ui/app.py:_persistent_config_dir +
-# _CONFIG_FILE / _LEGACY_CONFIG_FILE — keep these in sync if either
-# moves. Read order: persistent first, fall back to legacy in-tool path.
-import os as _os
-def _resolve_config_path() -> Path:
-    base = _os.environ.get("LOCALAPPDATA")
-    if not base:
-        base = _os.path.join(_os.path.expanduser("~"), "AppData", "Local")
-    persistent = Path(base) / "SC_Toolbox" / "mining_signals" / "config.json"
-    if persistent.is_file():
-        return persistent
-    legacy = TOOL / "mining_signals_config.json"
-    return legacy if legacy.is_file() else persistent
+# Config path resolution is shared with ui/app.py via
+# mining_shared/paths.py — both processes now compute identical
+# paths from one source of truth instead of duplicating the logic
+# here with a hardcoded persistent path.  Pre-refactor, the viewer
+# hardcoded the persistent path WITHOUT the app's makedirs-fallback,
+# so on locked-down machines (Controlled Folder Access etc.) the
+# app would silently fall back to the in-tool dir while the viewer
+# kept reading the unreachable persistent path — a silent drift
+# class that's now impossible because both go through paths.py.
+from mining_shared.paths import resolve_config_path as _resolve_config_path
 CONFIG_PATH = _resolve_config_path()
 POLL_MS = 500
 HISTORY_LEN = 10

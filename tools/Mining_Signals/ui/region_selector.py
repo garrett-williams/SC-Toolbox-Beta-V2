@@ -11,7 +11,7 @@ import ctypes
 
 from PySide6.QtCore import Qt, QRect, QPoint, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QCursor
-from PySide6.QtWidgets import QWidget, QApplication
+from PySide6.QtWidgets import QWidget, QApplication, QMessageBox
 
 from shared.qt.theme import P
 
@@ -135,6 +135,15 @@ class RegionSelector(QWidget):
             self._dragging = False
             end_native = _get_cursor_pos()
 
+            # Track sub-floor drops so we can surface a warning AFTER
+            # closing the overlay below.  Previously these were silently
+            # dropped with no user feedback — the selector just closed,
+            # the user assumed their region was saved, and nothing ever
+            # reached the handler.  See the comment at the size gate
+            # below for why this matters specifically for the signature
+            # scanner UI.
+            too_small: tuple[int, int] | None = None
+
             if self._origin_native:
                 ox, oy = self._origin_native
                 ex, ey = end_native
@@ -143,12 +152,40 @@ class RegionSelector(QWidget):
                 w = abs(ex - ox)
                 h = abs(ey - oy)
 
-                if w > 10 and h > 10:
+                # Minimum 4x4 native pixels — lowered from 10x10.  The
+                # old floor used to silently drop tight drags around
+                # small UI elements (notably the signature scanner
+                # value digits at 1080p / 100% scaling, where 10
+                # native pixels = 10 logical pixels and users were
+                # easily drawing a "tight" box that fell below the
+                # threshold).  Anything smaller than 4x4 is almost
+                # certainly an accidental click, not a real drag.
+                if w > 4 and h > 4:
                     self.region_selected.emit({
                         "x": x, "y": y, "w": w, "h": h,
                     })
+                else:
+                    too_small = (w, h)
             self.close()
             event.accept()
+            # Surface sub-floor drops AFTER closing the overlay so the
+            # user sees the warning instead of the selector silently
+            # disappearing.  Defensive try/except: if the message box
+            # itself fails for any reason (rare), at least don't crash
+            # the selector — the bumped save-failure logging in
+            # ``_save_config`` will still surface the rejection.
+            if too_small is not None:
+                try:
+                    QMessageBox.warning(
+                        None,
+                        "Region too small",
+                        f"The region you drew was "
+                        f"{too_small[0]}×{too_small[1]} pixels — too "
+                        "small to capture reliably.\n\nPlease draw a "
+                        "larger box around the area you want to scan.",
+                    )
+                except Exception:
+                    pass
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key_Escape:
