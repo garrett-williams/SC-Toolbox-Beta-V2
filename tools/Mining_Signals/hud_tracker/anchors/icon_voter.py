@@ -226,7 +226,20 @@ def _ensure_rgb_cnn_v2_session():
     try:
         import onnxruntime as ort  # type: ignore
     except Exception as exc:
-        log.debug("icon_voter: onnxruntime unavailable: %s", exc)
+        # WARNING (not DEBUG): onnxruntime failing to import means
+        # EVERY CNN voter in the scanner is permanently unavailable
+        # for this process — a user-facing total-scanner failure.
+        # Pre-v2.2.10-audit this was swallowed at DEBUG, so user
+        # crash logs only showed the SYMPTOM (`rgb_cnn=unavailable`)
+        # with no hint of the CAUSE.  Common causes worth checking
+        # when this fires: missing Visual C++ Redistributable, CPU
+        # without AVX2 (some onnxruntime wheels require it), an AV
+        # blocking the onnxruntime DLL.
+        log.warning(
+            "icon_voter: onnxruntime import failed (%s: %s) — "
+            "RGB CNN voter permanently unavailable",
+            type(exc).__name__, exc,
+        )
         return None, None, None
     try:
         opts = ort.SessionOptions()
@@ -238,7 +251,17 @@ def _ensure_rgb_cnn_v2_session():
             providers=["CPUExecutionProvider"],
         )
     except Exception as exc:
-        log.debug("icon_voter: failed to load RGB CNN v2: %s", exc)
+        # WARNING (not DEBUG): the model file is on disk
+        # (_HAS_RGB_V2 was True above) but onnxruntime can't open
+        # it.  Could be a corrupted file (AV quarantined a few
+        # bytes, partial Velopack apply), an incompatible onnxruntime
+        # version, or session-creation failure.  Surfacing the
+        # exception type + message in user logs so we can diagnose.
+        log.warning(
+            "icon_voter: failed to load RGB CNN v2 from %s "
+            "(%s: %s) — RGB CNN voter unavailable",
+            _RGB_CNN_V2_PATH, type(exc).__name__, exc,
+        )
         return None, None, None
     classes = "0123456789@"
     try:
@@ -336,7 +359,19 @@ def _ensure_gray_cnn_helper():
         from ocr.sc_ocr.api import _classify_crops_signal  # type: ignore
         _gray_cnn_helper = _classify_crops_signal
     except Exception as exc:
-        log.debug("icon_voter: gray CNN helper unavailable: %s", exc)
+        # WARNING (not DEBUG): if this import fails the gray voter
+        # is permanently unavailable for the process.  Often fires
+        # TOGETHER with the RGB voter's onnxruntime failure above
+        # (they share onnxruntime), producing the user-facing
+        # "votes={'rgb_cnn': 'unavailable', 'gray_cnn':
+        # 'unavailable'}" cascade where the scanner gives up
+        # before even looking at the panel.  Promoting to WARNING
+        # so the actual exception text reaches user crash logs.
+        log.warning(
+            "icon_voter: gray CNN helper import failed "
+            "(%s: %s) — gray CNN voter permanently unavailable",
+            type(exc).__name__, exc,
+        )
         _gray_cnn_helper = None
     return _gray_cnn_helper
 
