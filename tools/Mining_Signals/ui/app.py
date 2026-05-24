@@ -6037,6 +6037,45 @@ class MiningSignalsApp(SCWindow):
 # Entry-point helper
 # ---------------------------------------------------------------------------
 
+def _check_onnxruntime_at_startup(log) -> None:
+    """Surface a user-friendly dialog (instead of silent voter failure)
+    when onnxruntime can't load -- almost always means missing or
+    incompatible Visual C++ Redistributable. Without this, the scanner
+    silently degrades and the user sees only "scan returns nothing"
+    with no explanation. v2.2.11's icon_voter logging tells us WHY in
+    the log; this dialog tells the USER what to do about it."""
+    try:
+        import onnxruntime as ort  # type: ignore
+        # Bare import isn't always enough -- the native DLLs sometimes
+        # only get touched when a provider is enumerated. Force it.
+        _ = ort.get_available_providers()
+    except Exception as exc:
+        log.error(
+            "onnxruntime failed to load at startup (%s: %s) -- "
+            "Mining Signals scanner will be unavailable. Most likely "
+            "cause: missing or outdated Visual C++ Redistributable.",
+            type(exc).__name__, exc,
+        )
+        try:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                None,
+                "Mining Signals — missing dependency",
+                "The Mining Signals OCR engine can't start because the "
+                "Microsoft Visual C++ Runtime is missing or incompatible.\n\n"
+                f"Underlying error:\n  {type(exc).__name__}: {exc}\n\n"
+                "Fix: install the Microsoft Visual C++ Redistributable "
+                "(VS 2015-2022, x64) from:\n"
+                "https://aka.ms/vs/17/release/vc_redist.x64.exe\n\n"
+                "After installing it, restart SC Toolbox.\n\n"
+                "(SC Toolbox will keep running -- non-scanner features still "
+                "work -- but mining-signal OCR will be unavailable until "
+                "this is fixed.)",
+            )
+        except Exception:
+            pass  # Qt unavailable too -- error already logged above
+
+
 def main() -> None:
     """Launch Mining Signals from the command line."""
     from shared.crash_logger import init_crash_logging
@@ -6048,6 +6087,13 @@ def main() -> None:
 
         app = QApplication(sys.argv)
         apply_theme(app)
+
+        # Sanity-check onnxruntime BEFORE creating any scanner threads,
+        # so users with missing VC++ Runtime see a clear dialog instead
+        # of silent scanner failure. See _check_onnxruntime_at_startup
+        # for the failure mode this addresses (the v2.2.10 user crash
+        # where both CNN voters reported "unavailable").
+        _check_onnxruntime_at_startup(log)
 
         window = MiningSignalsApp(
             x=parsed["x"],
