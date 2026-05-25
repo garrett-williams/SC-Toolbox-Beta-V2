@@ -1086,6 +1086,118 @@ class HudPanelTracker:
             except Exception:
                 continue
 
+        # ── Fallback: colon-glyph NCC for missing row anchors ────────
+        #
+        # When label_match misses RESISTANCE or INSTABILITY (cropped
+        # HUD, dim text, chromatic aberration, non-standard scaling)
+        # the tracker would otherwise fall one anchor short of the
+        # 3-required cold-start quorum -- the
+        # "only 2 anchors found (need 3); keys=[label_mass,
+        # scan_results]" state seen in the v2.2.12 user crash log.
+        #
+        # Recover by running an INDEPENDENT colon-glyph NCC over the
+        # expected y-band: the colons after MASS / RESISTANCE /
+        # INSTABILITY are visually identical across all three rows
+        # and at all HUD scales (~3-6 px x ~10-14 px), so they
+        # survive the conditions that defeat the full-word label
+        # NCC.  Colons are returned top-to-bottom by the API, so
+        # positional assignment binds them to the missing
+        # label_<field> keys without needing to predict exact row
+        # pitch.
+        #
+        # Requires label_mass to be present (anchors the search
+        # y-band and shares the x-column with the missing labels --
+        # per the offset table all three label_<field> have
+        # offset_x = 0.0, so synthesizing the missing labels at
+        # mass_x is geometrically consistent with the rigid-body
+        # solver).
+        #
+        # Mirrors the parallel fallback in
+        # ``ocr.onnx_hud_reader._find_label_rows`` (lines 1379+)
+        # but inside the tracker's anchor-collection path so the
+        # cold-start quorum can be reached -- previously colon
+        # recovery only existed in a sibling code path that never
+        # ran for the failing user.
+        _NEEDED_LABEL_KEYS = ("label_resistance", "label_instability")
+        _missing = [k for k in _NEEDED_LABEL_KEYS if k not in measurements]
+        if _missing and "label_mass" in measurements:
+            _colons: list[dict] = []
+            _ca_y_top = 0
+            _ca_y_bot = 0
+            _ca_x_left = 0
+            _ca_x_right = 0
+            try:
+                try:
+                    from ocr.sc_ocr.colon_anchor import find_colons
+                except ImportError:
+                    from .colon_anchor import find_colons  # type: ignore
+                _mass_x, _mass_y = measurements["label_mass"]
+                # y-band: from a bit above mass downward enough to
+                # cover mass + resistance + instability rows.  200 px
+                # is generous at every observed HUD scale (mirrors
+                # _find_label_rows's choice).
+                _ca_y_top = max(0, int(_mass_y) - 20)
+                _ca_y_bot = min(img.height, int(_mass_y) + 200)
+                # x-band: from a bit left of mass's x to ~65% of img
+                # width (well before the value column starts so we
+                # don't false-fire on decimal dots in values like
+                # "8.01").
+                _ca_x_left = max(0, int(_mass_x) - 20)
+                _ca_x_right = min(img.width, int(img.width * 0.65))
+                _colons = find_colons(
+                    img,
+                    y_band=(_ca_y_top, _ca_y_bot),
+                    x_range=(_ca_x_left, _ca_x_right),
+                )
+            except Exception as exc:
+                log.debug(
+                    "HudPanelTracker: colon fallback raised: %s", exc,
+                )
+
+            if _colons:
+                _mass_x, _mass_y = measurements["label_mass"]
+                # Drop colons above the matched mass row -- those
+                # would belong to header rows (SCAN RESULTS,
+                # COMPOSITION) above the data rows, not the missing
+                # data-row labels we're trying to recover.  Then
+                # drop the first remaining colon (= mass's own
+                # colon, since mass already matched and we don't
+                # want to overwrite it).
+                _candidate_colons = [
+                    c for c in _colons if c["y"] >= _mass_y - 10
+                ]
+                _candidate_colons = _candidate_colons[1:]
+                _added: list[str] = []
+                for label_key in _NEEDED_LABEL_KEYS:
+                    if label_key in measurements:
+                        continue  # already matched, leave alone
+                    if not _candidate_colons:
+                        break
+                    _c = _candidate_colons.pop(0)
+                    # All three label_<field> have offset_x = 0.0
+                    # in the rigid-body offset table, so using
+                    # mass_x as the synthesized label x stays
+                    # geometrically consistent with the solver.
+                    measurements[label_key] = (
+                        float(_mass_x), float(_c["y"]),
+                    )
+                    _added.append(label_key)
+                if _added:
+                    log.warning(
+                        "HudPanelTracker: colon fallback synthesized "
+                        "%d missing anchor(s) from %d colon "
+                        "detection(s): %s",
+                        len(_added), len(_colons), _added,
+                    )
+            elif _missing:
+                log.warning(
+                    "HudPanelTracker: colon fallback ran but found "
+                    "0 colons in y_band=(%d, %d) x_range=(%d, %d) "
+                    "-- missing %s remain unmeasured",
+                    _ca_y_top, _ca_y_bot, _ca_x_left, _ca_x_right,
+                    _missing,
+                )
+
         return measurements
 
     # ─── Internal: LSQ solver and validation ───────────────────────
