@@ -29,8 +29,70 @@ import numpy as np
 from PIL import Image
 
 from . import capture, fallback, preprocess, validate
+from . import region_autoheal as _region_autoheal
 
 log = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Feature flag: self-healing region capture (v2.2.14+).
+#
+# When True (the default), ``scan_hud_onnx`` runs ``autoheal_capture``
+# instead of a bare ``capture.grab``. The autoheal layer enlarges the
+# user-supplied region, runs the RGB color-mask HUD locator on the
+# bigger grab, and crops back to the located panel — which rescues
+# users whose user-drawn region is too small to contain the full
+# SCAN RESULTS panel and was producing garbage values (the
+# "44 mass / 444,444" failure mode in v2.2.13).
+#
+# Three ways to override (checked in this order, first non-None wins):
+#   1. Environment variable ``SC_OCR_AUTO_HEAL_REGION`` set to one of
+#      "0"/"false"/"no"/"off" (disable) or "1"/"true"/"yes"/"on".
+#   2. Per-user JSON sidecar at
+#      ``%LOCALAPPDATA%/SC_Toolbox/sc_ocr/settings.json`` containing
+#      ``{"auto_heal_region": false}`` (or ``true``).
+#   3. Built-in default (True).
+#
+# The flag is read once per scan call so users can flip the JSON
+# sidecar without restarting the app. Lookups are caught defensively;
+# any failure falls back to the default.
+# ─────────────────────────────────────────────────────────────────────
+
+_AUTO_HEAL_DEFAULT = True
+
+
+def _read_auto_heal_region_flag() -> bool:
+    """Resolve the ``auto_heal_region`` feature flag.
+
+    See the module-level comment above for precedence and override
+    surface. Returns ``True``/``False`` — never raises.
+    """
+    env = os.environ.get("SC_OCR_AUTO_HEAL_REGION")
+    if env is not None:
+        v = env.strip().lower()
+        if v in {"0", "false", "no", "off"}:
+            return False
+        if v in {"1", "true", "yes", "on"}:
+            return True
+        # Unrecognized env value — log once and ignore.
+        log.warning(
+            "sc_ocr: ignoring unrecognized SC_OCR_AUTO_HEAL_REGION=%r",
+            env,
+        )
+
+    try:
+        from . import config as _cfg
+        import json as _json
+        from pathlib import Path as _Path
+        sidecar = _Path(_cfg.USER_ROOT) / "settings.json"
+        if sidecar.is_file():
+            data = _json.loads(sidecar.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "auto_heal_region" in data:
+                return bool(data["auto_heal_region"])
+    except Exception as exc:
+        log.debug("sc_ocr: settings.json lookup failed: %s", exc)
+
+    return _AUTO_HEAL_DEFAULT
 
 # Pre-compiled regex patterns (module scope)
 _RE_NUMERIC_TOKEN = re.compile(r"\d[\d.,]*%?")
@@ -14387,11 +14449,42 @@ def scan_hud_onnx(
     if _img_override is not None:
         img = _img_override
     else:
-        img = capture.grab(region)
-        if img is None:
+        # Self-healing capture (v2.2.14+). When the feature flag is
+        # enabled (default), expand the user region by a margin,
+        # capture that larger area, run the RGB color-mask HUD
+        # locator on it, and crop back to the detected panel. When
+        # the flag is disabled or the locator can't find the panel,
+        # this collapses to the pre-v2.2.14 behavior: a plain
+        # ``capture.grab(region)`` with a one-shot retry.
+        if _read_auto_heal_region_flag():
+            healed_img, _actual_region, _heal_diag = (
+                _region_autoheal.autoheal_capture(region)
+            )
+            if healed_img is None:
+                # Autoheal failed at the capture layer entirely —
+                # fall through to the legacy double-grab so behavior
+                # matches the pre-v2.2.14 retry semantics.
+                healed_img = capture.grab(region)
+                if healed_img is None:
+                    healed_img = capture.grab(region)
+                if healed_img is None:
+                    return empty
+            else:
+                log.debug(
+                    "sc_ocr: autoheal_capture heal=%s reason=%s "
+                    "capture_size=%s cropped_size=%s",
+                    _heal_diag.get("heal"),
+                    _heal_diag.get("fallback_reason"),
+                    _heal_diag.get("captured_size"),
+                    _heal_diag.get("cropped_size"),
+                )
+            img = healed_img
+        else:
             img = capture.grab(region)
-        if img is None:
-            return empty
+            if img is None:
+                img = capture.grab(region)
+            if img is None:
+                return empty
     if _dbg is not None:
         _dbg.set_image(img)
         # Write IMMEDIATELY so the viewer reflects the latest capture

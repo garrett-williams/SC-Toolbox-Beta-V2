@@ -3475,8 +3475,18 @@ class MiningSignalsApp(SCWindow):
     def _open_scan_region_selector(self) -> None:
         """Actually open the scanning-region selector. Called either
         directly (when the tip is dismissed) or as the on_proceed
-        callback when the user clicks OK on the tip."""
-        self._region_selector = RegionSelector()
+        callback when the user clicks OK on the tip.
+
+        v2.2.14: switched to SmartRegionSelector in "signature" mode --
+        shows a wire-diagram of Icon + Numbers boxes so the user
+        knows what shape to fit.  Pre-loads the previously-saved
+        region so re-edits start from where the user left off.
+        """
+        from .region_selector import SmartRegionSelector
+        self._region_selector = SmartRegionSelector(
+            mode="signature",
+            initial_region=self._config.get("ocr_region"),
+        )
         self._region_selector.region_selected.connect(self._on_region_selected)
         self._region_selector.show()
 
@@ -3515,8 +3525,23 @@ class MiningSignalsApp(SCWindow):
     def _open_hud_region_selector(self) -> None:
         """Actually open the HUD-region selector. Tip-gated entry
         point splits the show-tip and open-selector paths so the
-        selector waits until the user dismisses the tip."""
-        self._hud_region_selector = RegionSelector()
+        selector waits until the user dismisses the tip.
+
+        v2.2.14: switched to SmartRegionSelector in "hud" mode --
+        shows a wire-diagram of the 5 SCAN RESULTS panel rows
+        (title, resource, MASS, RESISTANCE, INSTABILITY) so the
+        user knows what shape to fit.  Pre-loads the previously-
+        saved region so re-edits start from where the user left off.
+        Combined with the autoheal capture path (region_autoheal.py)
+        the user no longer needs pixel-perfect calibration -- the
+        wire diagram shows the rough shape and autoheal corrects
+        sub-region misalignment at scan time.
+        """
+        from .region_selector import SmartRegionSelector
+        self._hud_region_selector = SmartRegionSelector(
+            mode="hud",
+            initial_region=self._config.get("hud_region"),
+        )
         self._hud_region_selector.region_selected.connect(self._on_hud_region_selected)
         self._hud_region_selector.show()
 
