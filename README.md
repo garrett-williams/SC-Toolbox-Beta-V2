@@ -41,11 +41,12 @@
 
 ---
 
-## What's New in v2.2.6
+## What's New in v2.2.8
 
-- **SC_OCR engine** — purpose-built OCR pipeline for Star Citizen's HUD that powers Mining Signals. CNN-based digit recognition with adaptive thresholding, multi-frame averaging, position-locked row tracking, and self-correcting glyph extraction. Reads mass / resistance / instability from the SCAN RESULTS panel and signal scan percentages with much higher accuracy than the previous Tesseract-only pipeline.
-- **Privacy hardening** — file logs and crash dumps are scrubbed of home-directory paths, usernames, hostnames, IPs, and auth tokens at write time. Nothing personally identifying leaves your machine in a debug or crash report.
-- **Cleaner installer** — ~150 MB smaller. Build pipeline now strips PyTorch ONNX stack-trace metadata and pip-generated wrapper shebangs that previously carried the build-machine username.
+- **RGB CNN voter for Mining Signals** — the SC_OCR pipeline now runs an RGB-trained CNN (plus a per-channel-inverted variant) as the primary digit reader, with the original grayscale CNN, CRNN, and Tesseract as fallback voters. Stops losing thin-stroke digits like 9s in low-contrast frames and reads faster on the high-confidence path.
+- **Glyph reviewer drag-select + augmentation cascade** — the training-data review tool (`scripts/review_glyphs.py`) now supports bounding-box drag-select for picking multiple glyphs in one sweep, and automatically moves a sample's augmented siblings (`aug_*.png`) when you re-classify the original.
+- **Stability fixes** — multi-recipe adaptive binarization for wide signature spans, equal-width splitter when blobs survive binarization, glyph-height-proportional comma masking, and a hysteresis gate on signal-value acceptance to suppress single-frame OCR jitter.
+- **Bundled-runtime fixes** — `scipy` now correctly declared in the Mining_Signals runtime requirements (was silently missing). Paddle sidecar pip uses `--only-binary=:all:` to avoid the Rust-toolchain-required `python-bidi` sdist on Python 3.13.
 
 ---
 

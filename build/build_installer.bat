@@ -273,7 +273,7 @@ for %%S in (Cargo_loader Craft_Database DPS_Calculator Market_Finder Mining_Load
 
 :: tools/ — copy each tool, then prune non-runtime files
 echo  [*] Staging tools...
-for %%T in (Battle_Buddy Mining_Signals) do (
+for %%T in (Battle_Buddy Mining_Signals PlayTime_Calculator) do (
     if exist "%ROOT%\tools\%%T" (
         xcopy "%ROOT%\tools\%%T" "%STAGE%\tools\%%T\" /s /i /q >nul
         :: Remove cache, log, and dev files
