@@ -219,6 +219,7 @@ class SCToolboxApp:
             current_language=self._settings.language,
             available_languages=i18n.available_languages(_skill_dir),
             disabled_skills=self._settings.disabled_skills,
+            keybinds_disabled=self._settings.keybinds_disabled,
             grid_rows=self._settings.grid_rows,
             grid_cols=self._settings.grid_cols,
             grid_layout=self._settings.grid_layout,
@@ -435,11 +436,14 @@ class SCToolboxApp:
     def _build_hotkey_bindings(self) -> dict:
         bindings = {}
         disabled = set(self._settings.disabled_skills)
-        if self._launcher_hotkey:
+        kb_disabled = set(self._settings.keybinds_disabled)
+        if self._launcher_hotkey and "launcher" not in kb_disabled:
             bindings[self._launcher_hotkey] = lambda: self._enqueue(
                 self._window.toggle_visibility)
         for skill in self._skills:
             if skill.id in disabled:
+                continue
+            if skill.id in kb_disabled:
                 continue
             hk = skill.hotkey
             sid = skill.id
@@ -480,6 +484,10 @@ class SCToolboxApp:
 
         # Update disabled skills
         self._settings.disabled_skills = settings_dict.get("disabled_skills", [])
+
+        # Update disabled keybinds (per-tool hotkey on/off)
+        self._settings.keybinds_disabled = settings_dict.get(
+            "keybinds_disabled", self._settings.keybinds_disabled)
 
         # Update scroll on hover
         self._settings.scroll_on_hover = settings_dict.get("scroll_on_hover", self._settings.scroll_on_hover)
@@ -556,6 +564,7 @@ class SCToolboxApp:
             current_language=self._settings.language,
             available_languages=i18n.available_languages(_skill_dir),
             disabled_skills=self._settings.disabled_skills,
+            keybinds_disabled=self._settings.keybinds_disabled,
             grid_rows=self._settings.grid_rows,
             grid_cols=self._settings.grid_cols,
             grid_layout=self._settings.grid_layout,

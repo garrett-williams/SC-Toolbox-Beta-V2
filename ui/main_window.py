@@ -3,6 +3,7 @@ Main launcher window — PySide6 MobiGlas-style implementation.
 
 Assembles header, tile grid, and settings panel using the shared Qt library.
 """
+import json
 import logging
 import os
 import queue as _queue
@@ -29,6 +30,13 @@ from ui.tiles import SkillTile, build_tile_grid
 from ui.settings_panel import SettingsPopup
 
 log = logging.getLogger(__name__)
+
+# Cross-process summary written by the PlayTime Calculator tool.  The launcher
+# reads it to show the player's total play time (in their preferred format) on
+# the main menu without having to launch or rescan anything itself.
+_PLAYTIME_SUMMARY = os.path.join(
+    os.path.expanduser("~"), ".sctoolbox", "playtime", "summary.json")
+_PLAYTIME_REFRESH_MAX_AGE = 3 * 3600  # re-scan in the background if older than this
 
 
 def get_hotkey_display(key: str) -> str:
@@ -323,6 +331,7 @@ class LauncherWindow(SCWindow):
         current_language: str = "en",
         available_languages: Optional[List[str]] = None,
         disabled_skills: Optional[List[str]] = None,
+        keybinds_disabled: Optional[List[str]] = None,
         grid_rows: int = 3,
         grid_cols: int = 2,
         grid_layout: Optional[Dict[str, str]] = None,
@@ -340,12 +349,15 @@ class LauncherWindow(SCWindow):
             opacity=geometry.opacity,
         )
         self._skills = skills
+        self._availability = availability
+        self._on_toggle_skill = on_toggle_skill
         self._on_shutdown = on_shutdown
         self._on_apply_settings = on_apply_settings
         self._launcher_hotkey = launcher_hotkey
         self._current_language = current_language
         self._available_languages = available_languages or ["en"]
         self._disabled_skills = disabled_skills or []
+        self._keybinds_disabled = keybinds_disabled or []
         self._grid_rows = grid_rows
         self._grid_cols = grid_cols
         self._grid_layout = grid_layout or {}
@@ -429,6 +441,38 @@ class LauncherWindow(SCWindow):
         fleet.mousePressEvent = lambda e: webbrowser.open("https://hangar.link/fleet/canvas")
         h_layout.addWidget(fleet)
 
+        # PlayTime Calculator link + live total badge.  The link opens the tool;
+        # the badge shows the player's total play time in their preferred format
+        # (read from the tool's summary cache — see _refresh_playtime_badge).
+        self._playtime_badge: Optional[QLabel] = None
+        if self._availability.get("playtime"):
+            playtime = QLabel(_t("PLAY TIME"), header)
+            playtime.setStyleSheet("""
+                font-family: Consolas; font-size: 8pt; font-weight: bold;
+                color: #44ccff; background: transparent;
+            """)
+            playtime.setCursor(Qt.PointingHandCursor)
+            playtime.setToolTip(_t("Open the PlayTime Calculator"))
+            playtime.mousePressEvent = lambda e: self._launch_playtime()
+            h_layout.addWidget(playtime)
+
+            self._playtime_badge = QLabel("", header)
+            self._playtime_badge.setStyleSheet("""
+                font-family: Consolas; font-size: 8pt; font-weight: bold;
+                color: #e8f2ff; background: rgba(68,204,255,0.14); padding: 1px 6px;
+            """)
+            self._playtime_badge.setCursor(Qt.PointingHandCursor)
+            self._playtime_badge.mousePressEvent = lambda e: self._launch_playtime()
+            self._playtime_badge.hide()
+            h_layout.addWidget(self._playtime_badge)
+
+            self._playtime_timer = QTimer(self)
+            self._playtime_timer.setInterval(4000)
+            self._playtime_timer.timeout.connect(self._refresh_playtime_badge)
+            self._playtime_timer.start()
+            QTimer.singleShot(0, self._refresh_playtime_badge)
+            QTimer.singleShot(900, self._maybe_refresh_playtime_summary)
+
         h_layout.addStretch(1)
 
         # Status
@@ -491,11 +535,14 @@ class LauncherWindow(SCWindow):
         )
         self.content_layout.addWidget(tiles_container, stretch=1)
 
-        # Set initial hotkey badges
+        # Set initial hotkey badges (blank when the keybind is disabled)
         for skill in enabled_skills:
             tile = self._tiles.get(skill.id)
             if tile:
-                tile.set_hotkey(get_hotkey_display(skill.hotkey))
+                if skill.id in self._keybinds_disabled:
+                    tile.set_hotkey("")
+                else:
+                    tile.set_hotkey(get_hotkey_display(skill.hotkey))
 
         # ── Settings button ──
         from ui.settings_panel import _btn_qss
@@ -511,13 +558,79 @@ class LauncherWindow(SCWindow):
         if tile:
             tile.update_status(running, visible)
 
+    # ── PlayTime Calculator integration ──
+
+    def _launch_playtime(self) -> None:
+        """Open (or toggle) the PlayTime Calculator tool from the header link."""
+        try:
+            self._on_toggle_skill("playtime")
+        except Exception:
+            log.exception("failed to toggle playtime tool")
+
+    def _refresh_playtime_badge(self) -> None:
+        """Update the main-menu total from the tool's summary cache."""
+        if not self._playtime_badge:
+            return
+        try:
+            with open(_PLAYTIME_SUMMARY, encoding="utf-8") as f:
+                summary = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        badge = str(summary.get("badge", "")).strip()
+        if not badge:
+            return
+        self._playtime_badge.setText(badge)
+        sessions = summary.get("session_count")
+        headline = summary.get("calendar") or summary.get("headline") or ""
+        tip = headline
+        if sessions:
+            tip = f"{headline}  ·  {sessions:,} sessions"
+        self._playtime_badge.setToolTip(tip.strip(" ·"))
+        self._playtime_badge.show()
+
+    def _maybe_refresh_playtime_summary(self) -> None:
+        """If the cached summary is missing or stale, refresh it in the
+        background via the tool's headless mode so the badge stays current
+        even when the user never opens the tool window."""
+        try:
+            import time
+            age = None
+            try:
+                age = time.time() - os.path.getmtime(_PLAYTIME_SUMMARY)
+            except OSError:
+                pass  # missing → refresh
+            if age is not None and age < _PLAYTIME_REFRESH_MAX_AGE:
+                return
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            script = os.path.join(root, "tools", "PlayTime_Calculator", "playtime_app.py")
+            if not os.path.isfile(script):
+                return
+            import subprocess
+            import sys
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                 | getattr(subprocess, "DETACHED_PROCESS", 0))
+            subprocess.Popen(
+                [sys.executable, script, "--headless"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, cwd=os.path.dirname(script),
+                creationflags=creationflags, close_fds=True)
+            # Pick up the freshly-written summary shortly after it finishes.
+            QTimer.singleShot(3500, self._refresh_playtime_badge)
+        except Exception:
+            log.exception("playtime: background summary refresh failed")
+
     def update_hotkey_badges(self, launcher_hotkey: str, skill_hotkeys: Dict[str, str]) -> None:
         self._title_bar.set_hotkey(get_hotkey_display(launcher_hotkey))
         for skill in self._skills:
             tile = self._tiles.get(skill.id)
             if tile:
-                hk = skill_hotkeys.get(skill.id, skill.hotkey)
-                tile.set_hotkey(get_hotkey_display(hk))
+                if skill.id in self._keybinds_disabled:
+                    tile.set_hotkey("")
+                else:
+                    hk = skill_hotkeys.get(skill.id, skill.hotkey)
+                    tile.set_hotkey(get_hotkey_display(hk))
 
     def set_status(self, text: str, color: Optional[str] = None) -> None:
         self._status_label.setText(text)
@@ -554,6 +667,7 @@ class LauncherWindow(SCWindow):
             skills=self._skills,
             launcher_hotkey=self._launcher_hotkey,
             disabled_skills=self._disabled_skills,
+            keybinds_disabled=self._keybinds_disabled,
             grid_rows=self._grid_rows,
             grid_cols=self._grid_cols,
             grid_layout=self._grid_layout,

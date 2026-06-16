@@ -225,6 +225,7 @@ class SettingsPopup(QWidget):
         skills: List[SkillConfig],
         launcher_hotkey: str,
         disabled_skills: List[str],
+        keybinds_disabled: List[str],
         grid_rows: int,
         grid_cols: int,
         grid_layout: Dict[str, str],
@@ -240,7 +241,7 @@ class SettingsPopup(QWidget):
         self.setObjectName("settingsPopup")
         self.setWindowOpacity(opacity)
         self.setStyleSheet(f"QWidget#settingsPopup {{ background-color: {P.bg_header}; }}")
-        self.setFixedSize(520, 560)
+        self.setFixedSize(560, 560)
 
         self._parent_window = parent_window
         self._skills = skills
@@ -253,6 +254,7 @@ class SettingsPopup(QWidget):
         self._launcher_hotkey = launcher_hotkey
         self._skill_hotkeys: Dict[str, str] = {s.id: s.hotkey for s in skills}
         self._disabled: set[str] = set(disabled_skills)
+        self._keybinds_disabled: set[str] = set(keybinds_disabled)
         self._grid_rows = grid_rows
         self._grid_cols = grid_cols
         self._grid_layout: Dict[str, str] = dict(grid_layout)
@@ -265,6 +267,11 @@ class SettingsPopup(QWidget):
         self._wheel_filter = _HoverWheelFilter(self)
         self._wheel_filter.set_enabled(scroll_on_hover)
 
+        # Save-on-close bookkeeping: closing the popup saves settings (same as
+        # Apply); only Cancel discards.  These flags guard against double-saving.
+        self._committed = False
+        self._cancelled = False
+
         self._build_ui()
 
         # Install on QApplication so it intercepts all wheel events
@@ -272,6 +279,10 @@ class SettingsPopup(QWidget):
 
         self._select_tab(0)
         self._position_near_parent()
+
+        # Snapshot the initial state so closeEvent can skip a needless save +
+        # UI rebuild when the popup is closed without any changes.
+        self._baseline = self._collect_and_validate()
 
     # ── Positioning ───────────────────────────────────────────────────────
 
@@ -412,7 +423,7 @@ class SettingsPopup(QWidget):
         cancel_btn.setStyleSheet(_btn_qss(
             "#2a1a18", "#3a2a28", P.fg_dim, font_size="8pt", padding="5px 14px",
         ))
-        cancel_btn.clicked.connect(self.close)
+        cancel_btn.clicked.connect(self._on_cancel_clicked)
         b_lay.addWidget(cancel_btn)
 
         apply_btn = SCButton(_t("Apply"), bottom, glow_color=P.green)
@@ -494,9 +505,18 @@ class SettingsPopup(QWidget):
         """)
         c_lay.addWidget(hint)
 
+        # Column hint — clarifies the two toggles on each row
+        col_hint = QLabel(_t("Left toggle = tool on/off    Right toggle = keybind on/off"))
+        col_hint.setStyleSheet(f"""
+            font-family: Consolas; font-size: 7pt;
+            color: {P.fg_disabled}; background: transparent;
+        """)
+        c_lay.addWidget(col_hint)
+
         # Launcher hotkey row
         self._hotkey_entries: Dict[str, QLineEdit] = {}
         self._toggle_checks: Dict[str, QCheckBox] = {}
+        self._keybind_checks: Dict[str, QCheckBox] = {}
 
         launcher_row = self._make_tool_row(c_lay, "launcher", "SC_Toolbox", self._launcher_hotkey, show_toggle=False)
 
@@ -642,7 +662,7 @@ class SettingsPopup(QWidget):
 
         # Tool name
         lbl = QLabel(label)
-        lbl.setMinimumWidth(150)
+        lbl.setMinimumWidth(130)
         lbl.setStyleSheet(f"""
             font-family: Consolas; font-size: 9pt;
             color: {P.fg}; background: transparent;
@@ -660,7 +680,7 @@ class SettingsPopup(QWidget):
 
             # Enabled/Disabled label
             state_lbl = QLabel(_t("Enabled") if enabled else _t("Disabled"))
-            state_lbl.setFixedWidth(60)
+            state_lbl.setFixedWidth(54)
             state_lbl.setStyleSheet(f"""
                 font-family: Consolas; font-size: 7pt;
                 color: {P.green if enabled else P.red}; background: transparent;
@@ -686,13 +706,43 @@ class SettingsPopup(QWidget):
         row.addWidget(hk_label)
 
         entry = QLineEdit(hotkey)
-        entry.setMinimumWidth(120)
+        entry.setMinimumWidth(96)
         entry.setFixedHeight(24)
         entry.setStyleSheet(_LINE_EDIT_QSS)
         row.addWidget(entry, 1)
 
+        # Keybind on/off toggle — disables the global hotkey without disabling
+        # the tool itself.  Greys the entry and blanks the tile badge when off.
+        kb_on = key not in self._keybinds_disabled
+        entry.setEnabled(kb_on)
+
+        kb_toggle = QCheckBox()
+        kb_toggle.setChecked(kb_on)
+        kb_toggle.setStyleSheet(_TOGGLE_QSS)
+        kb_toggle.setToolTip(_t("Turn this keybind on or off"))
+        row.addWidget(kb_toggle)
+
+        kb_state = QLabel(_t("Key On") if kb_on else _t("Key Off"))
+        kb_state.setFixedWidth(50)
+        kb_state.setStyleSheet(f"""
+            font-family: Consolas; font-size: 7pt;
+            color: {P.green if kb_on else P.red}; background: transparent;
+        """)
+
+        def _on_kb_toggle(checked, sl=kb_state, e=entry):
+            e.setEnabled(checked)
+            sl.setText(_t("Key On") if checked else _t("Key Off"))
+            color = P.green if checked else P.red
+            sl.setStyleSheet(f"""
+                font-family: Consolas; font-size: 7pt;
+                color: {color}; background: transparent;
+            """)
+        kb_toggle.toggled.connect(_on_kb_toggle)
+        row.addWidget(kb_state)
+
         layout.addWidget(row_widget)
         self._hotkey_entries[key] = entry
+        self._keybind_checks[key] = kb_toggle
 
     # ── Tab 2: Grid Layout ────────────────────────────────────────────────
 
@@ -872,8 +922,10 @@ class SettingsPopup(QWidget):
 
     # ── Apply ─────────────────────────────────────────────────────────────
 
-    def _on_apply_clicked(self):
-        # Gather all settings
+    def _collect_and_validate(self) -> Optional[dict]:
+        """Gather every control's value into a settings dict and validate the
+        hotkeys.  Returns the dict, or ``None`` if a hotkey is invalid (in which
+        case a status message is shown)."""
         result: dict = {}
 
         # Launcher hotkey
@@ -894,6 +946,13 @@ class SettingsPopup(QWidget):
             if toggle and not toggle.isChecked():
                 disabled.append(skill.id)
         result["disabled_skills"] = disabled
+
+        # Disabled keybinds (per-tool hotkey on/off; keys include "launcher")
+        keybinds_disabled: list[str] = []
+        for kb_key, chk in self._keybind_checks.items():
+            if not chk.isChecked():
+                keybinds_disabled.append(kb_key)
+        result["keybinds_disabled"] = keybinds_disabled
 
         # Grid settings
         result["grid_rows"] = self._rows_spin.value()
@@ -922,14 +981,67 @@ class SettingsPopup(QWidget):
         for key, val in [("launcher", result["hotkey_launcher"])] + [(k, v) for k, v in skill_hotkeys.items()]:
             if val and not any(c.isalnum() or c in "`~!@#$%^&*" for c in val):
                 self._show_status(f"\u2717 {_t('Invalid hotkey')}: {val}", P.red)
-                return
+                return None
 
-        # Close popup before relaunch so it doesn't float orphaned
-        # after the parent launcher window has already closed.
+        return result
+
+    def _on_apply_clicked(self):
+        result = self._collect_and_validate()
+        if result is None:
+            return
+        # Mark committed so closeEvent doesn't try to save a second time.
+        self._committed = True
+        # Close popup before relaunch so it doesn't float orphaned after the
+        # parent launcher window has already closed.
         self.close()
-
         if self._on_apply:
             self._on_apply(result)
+
+    def _on_cancel_clicked(self):
+        """Discard changes and close without saving."""
+        self._cancelled = True
+        self.close()
+
+    def _remove_wheel_filter(self):
+        """Detach the app-level wheel filter so it doesn't outlive the popup."""
+        try:
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app:
+                app.removeEventFilter(self._wheel_filter)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        """Save settings when the popup closes \u2014 closing via the [x] button (or
+        the window manager) commits the current values, exactly like Apply.
+        Only the Cancel button discards.  If a hotkey is invalid the close is
+        blocked so the user can correct it (or hit Cancel to abandon).
+
+        During application shutdown we skip the save: applying would rebuild the
+        launcher window and resurrect the UI as the app is trying to quit."""
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        shutting_down = bool(app and app.closingDown())
+
+        if not self._committed and not self._cancelled and not shutting_down:
+            result = self._collect_and_validate()
+            if result is None:
+                event.ignore()  # keep open until the invalid hotkey is fixed
+                return
+            if self._baseline is not None and result == self._baseline:
+                # Nothing changed — close without a needless save + UI rebuild.
+                self._remove_wheel_filter()
+                super().closeEvent(event)
+                return
+            self._committed = True
+            self._remove_wheel_filter()
+            if self._on_apply:
+                self._on_apply(result)
+            event.accept()
+            return
+        self._remove_wheel_filter()
+        super().closeEvent(event)
 
     def _show_status(self, msg: str, color: str):
         self._status_label.setText(msg)
